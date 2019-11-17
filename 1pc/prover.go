@@ -34,9 +34,20 @@ const (
 type transactionRecord struct {
 	status          int32
 	participantList []int
+	// debug usage
+	delta int
+}
+
+type history struct {
+	delta   int
+	tid     int
+	success bool
 }
 
 var (
+	historysMu sync.Mutex
+	// deltas
+	historys            map[int][]history
 	entrymu             [maxUID - minUID + 1]sync.Mutex
 	store               map[int]*Entry
 	mu                  sync.Mutex
@@ -69,6 +80,7 @@ const (
 func initData(minUID, maxUID, numPerUID int) {
 	store = make(map[int]*Entry)
 	transactions = make(map[int]*transactionRecord)
+	historys = make(map[int][]history)
 	for i := minUID; i <= maxUID; i++ {
 		store[i] = &Entry{num: numPerUID}
 	}
@@ -80,7 +92,7 @@ func applyLocked(uid int, e *Entry) (deleted bool) {
 		return false
 	}
 	e.num -= e.write_intent.delta
-	log.Printf("uid %d after apply %d\n", uid, e.num)
+	log.Printf("uid %d after apply tid %d num %d\n", uid, e.write_intent.tid, e.num)
 	e.write_intent = nil
 	if e.num == 0 {
 		mu.Lock()
@@ -96,6 +108,7 @@ func applyLocked(uid int, e *Entry) (deleted bool) {
 func resolveWhenSTW(uid int) {
 	e, ok := store[uid]
 	if !ok || e.write_intent == nil {
+		log.Printf("uid %d is clean", uid)
 		return
 	}
 	tid := e.write_intent.tid
@@ -110,7 +123,7 @@ func resolveWhenSTW(uid int) {
 		aborted := false
 		for _, id := range tr.participantList {
 			anotherEntry, ok := store[id]
-			if !ok || anotherEntry.write_intent == nil {
+			if !ok || anotherEntry.write_intent == nil || anotherEntry.write_intent.tid != tid {
 				// the transaction is failed.
 				aborted = true
 				tr.status = ABORTED
@@ -118,6 +131,7 @@ func resolveWhenSTW(uid int) {
 			}
 		}
 		if !aborted {
+			tr.status = COMMITTED
 			applyLocked(uid, e)
 		} else {
 			e.write_intent = nil
@@ -129,8 +143,18 @@ func resolveWhenSTW(uid int) {
 	}
 }
 
-func resolveAndPropose(uid int, e *Entry, write_intent *WriteIntent) (conflicted bool) {
+func resolveAndPropose(uid int, write_intent *WriteIntent) (conflicted bool) {
 	entrymu[uid].Lock()
+	mu.Lock()
+	e, ok := store[uid]
+	if !ok {
+		e = &Entry{num: 0, write_intent: write_intent}
+		store[uid] = e
+		mu.Unlock()
+		entrymu[uid].Unlock()
+		return false
+	}
+	mu.Unlock()
 	old_write_intent := e.write_intent
 	if e.write_intent == nil {
 		e.write_intent = write_intent
@@ -148,35 +172,42 @@ func resolveAndPropose(uid int, e *Entry, write_intent *WriteIntent) (conflicted
 		transactions[tid] = &transactionRecord{
 			status: ABORTED,
 		}
-		log.Printf("set transaction tid %d record to %v\n", tid, transactions[tid])
-	}
-	transactionsMu.Unlock()
-	if !ok {
+		log.Printf("set transaction tid %d record ABORT\n", tid)
+		transactionsMu.Unlock()
 		entrymu[uid].Lock()
 		swapped := atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&e.write_intent)), unsafe.Pointer(old_write_intent), unsafe.Pointer(write_intent))
 		entrymu[uid].Unlock()
-		return swapped
+		log.Printf("swap uid %d from tid %d to tid %d %t", uid, old_write_intent.tid, write_intent.tid, swapped)
+		return !swapped
 	}
+	transactionsMu.Unlock()
 
 	s := atomic.LoadInt32(&tr.status)
 	log.Printf("transaction %d is %d\n", tid, s)
 	switch s {
 	case STAGING:
 		for _, key := range tr.participantList {
-			mu.Lock()
 			entrymu[key].Lock()
+			mu.Lock()
 			anotherEntry, ok := store[key]
+			log.Printf("uid %d in tid %d check is %v\n", key, tid, anotherEntry)
 			if !ok {
 				anotherEntry = &Entry{num: 0}
 				store[key] = anotherEntry
 			}
-			entrymu[key].Unlock()
 			mu.Unlock()
-			entrymu[key].Lock()
 			if anotherEntry.write_intent == nil {
+				log.Printf("set nil write_intent uid %d to tid -1\n", uid)
 				// try to insert this into store to make possible running transaction failed.
 				anotherEntry.write_intent = &WriteIntent{tid: notPossibleTID}
 				entrymu[key].Unlock()
+				atomic.CompareAndSwapInt32(&tr.status, STAGING, ABORTED)
+				return true
+			}
+			log.Printf("uid %d in tid %d check write_intent is tid %d\n", key, tid, anotherEntry.write_intent.tid)
+			if anotherEntry.write_intent.tid != tid {
+				entrymu[key].Unlock()
+				atomic.CompareAndSwapInt32(&tr.status, STAGING, ABORTED)
 				return true
 			}
 			entrymu[key].Unlock()
@@ -184,7 +215,7 @@ func resolveAndPropose(uid int, e *Entry, write_intent *WriteIntent) (conflicted
 		// all keys are ready, commit.
 		if atomic.CompareAndSwapInt32(&tr.status, STAGING, COMMITTED) {
 			entrymu[uid].Lock()
-			log.Printf("STAGING prepare to apply %d in transaction id %d status %d\n", uid, tid, s)
+			log.Printf("STAGING prepare to apply %d in tid %d status %d\n", uid, tid, s)
 			if applyLocked(uid, e) {
 				mu.Lock()
 				store[uid] = &Entry{num: 0, write_intent: write_intent}
@@ -198,7 +229,12 @@ func resolveAndPropose(uid int, e *Entry, write_intent *WriteIntent) (conflicted
 		return true
 	case COMMITTED:
 		entrymu[uid].Lock()
-		log.Printf("COMMITTED prepare to apply %d in transaction id %d status %d\n", uid, tid, s)
+		if e.write_intent.tid != tid {
+			log.Printf("tid %d COMMITED but key %d is in tid %d\n", tid, uid, e.write_intent.tid)
+			entrymu[uid].Unlock()
+			return true
+		}
+		log.Printf("COMMITTED prepare to apply %d in tid %d status %d\n", uid, e.write_intent.tid, s)
 		if applyLocked(uid, e) {
 			mu.Lock()
 			store[uid] = &Entry{num: 0, write_intent: write_intent}
@@ -207,27 +243,15 @@ func resolveAndPropose(uid int, e *Entry, write_intent *WriteIntent) (conflicted
 			e.write_intent = write_intent
 		}
 		entrymu[uid].Unlock()
-		// check whether we are the last write_intent.
-		for _, key := range tr.participantList {
-			mu.Lock()
-			anotherEntry, ok := store[key]
-			mu.Unlock()
-			entrymu[key].Lock()
-			if ok && anotherEntry.write_intent != nil && anotherEntry.write_intent.tid == tid {
-				entrymu[key].Unlock()
-				return false
-			}
-			entrymu[key].Unlock()
-		}
-		// we are the last write_intent in this transaction
-		transactionsMu.Lock()
-		log.Printf("deleting tid %d\n", tid)
-		delete(transactions, tid)
-		transactionsMu.Unlock()
+		// don't delete transaction record for debug usage
 		return false
 	case ABORTED:
-		e.write_intent = nil
-		return false
+		entrymu[uid].Lock()
+		log.Printf("check uid %d when tid %d in tid %d is ABORTED", uid, write_intent.tid, tid)
+		swapped := atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&e.write_intent)), unsafe.Pointer(old_write_intent), unsafe.Pointer(write_intent))
+		log.Printf("uid %d in tid %d ABORTED cas to tid %d %t", uid, tid, write_intent.tid, swapped)
+		entrymu[uid].Unlock()
+		return !swapped
 	}
 	panic("unreachable")
 }
@@ -235,28 +259,11 @@ func resolveAndPropose(uid int, e *Entry, write_intent *WriteIntent) (conflicted
 func begin(uid int, tid int, delta int) bool {
 	// inject random failure
 	if rand.Intn(100) < failureRate {
-		return false
+		log.Printf("tid %d user %d failed", tid, uid)
+		// return conflicted to indicate this transaction is failed
+		return true
 	}
-	mu.Lock()
-	fuser := store[uid]
-	mu.Unlock()
-
-	flag := false
-	entrymu[uid].Lock()
-	if fuser == nil {
-		mu.Lock()
-		if store[uid] == nil {
-			flag = true
-			store[uid] = &Entry{num: 0, write_intent: &WriteIntent{tid: int(tid), delta: delta}}
-			fuser = store[uid]
-		}
-		mu.Unlock()
-	}
-	entrymu[uid].Unlock()
-	if !flag {
-		return resolveAndPropose(uid, fuser, &WriteIntent{tid: int(tid), delta: delta})
-	}
-	return false
+	return resolveAndPropose(uid, &WriteIntent{tid: int(tid), delta: delta})
 }
 
 func transfer(from, to int) bool {
@@ -264,15 +271,29 @@ func transfer(from, to int) bool {
 	randomDelta := rand.Intn(10) + 1
 
 	tid := int(atomic.AddInt64(&globalTransactionID, 1))
-	conflicted := begin(from, tid, randomDelta) || begin(to, tid, -randomDelta)
+	fromconflict, toconflict := begin(from, tid, randomDelta), begin(to, tid, -randomDelta)
 
+	tidconflicted := false
 	transactionsMu.Lock()
-	transactions[tid] = &transactionRecord{status: STAGING, participantList: []int{from, to}}
-	log.Printf("set transaction tid %d record to %v\n", tid, transactions[tid])
-	transactionsMu.Unlock()
-	if !conflicted {
-		log.Printf("transfer from %d to %d delta %d\n", from, to, randomDelta)
+	if _, ok := transactions[tid]; ok {
+		tidconflicted = true
+		log.Printf("set transaction tid %d record conflicted\n", tid)
+	} else {
+		transactions[tid] = &transactionRecord{delta: randomDelta, status: STAGING, participantList: []int{from, to}}
+		log.Printf("set transaction tid %d record to %v\n", tid, transactions[tid])
 	}
+	transactionsMu.Unlock()
+
+	conflicted := fromconflict || toconflict || tidconflicted
+	log.Printf("tid %d fromconflict %t toconflict %t tidconflicted %t", tid, fromconflict, toconflict, tidconflicted)
+	historysMu.Lock()
+	historys[from] = append(historys[from], history{delta: randomDelta, tid: tid, success: !conflicted})
+	historys[to] = append(historys[to], history{delta: -randomDelta, tid: tid, success: !conflicted})
+	historysMu.Unlock()
+	if !conflicted {
+		log.Printf("tid %d transfer from %d to %d delta %d\n", tid, from, to, randomDelta)
+	}
+
 	return conflicted
 }
 
@@ -291,6 +312,9 @@ func randomTransfer(id int, globalTransferTimes *int64, globalConflictTimes *int
 		}
 		start := rand.Intn(maxUID-minUID) + minUID
 		end := rand.Intn(maxUID-minUID) + minUID
+		if start == end {
+			continue
+		}
 		if transfer(start, end) {
 			localConflictNum++
 		}
@@ -302,14 +326,26 @@ func checkNumSum(minUID, maxUID, numPerUID int) {
 	actual := 0
 	for i := minUID; i <= maxUID; i++ {
 		resolveWhenSTW(i)
+		origin := numPerUID
+		for _, history := range historys[i] {
+			if history.success {
+				origin -= history.delta
+			}
+		}
 		if e, ok := store[i]; ok {
 			if e.write_intent != nil {
 				panic(fmt.Sprintf("uid %d write_intent is not null after resolve, write_intent %v", i, e.write_intent))
 			}
+			if origin != e.num {
+				log.Printf("uid %d replay history failed origin %d actual %d historys %v", i, origin, e.num, historys[i])
+			}
 			actual += e.num
 			log.Printf("uid %d num %d\n", i, e.num)
 		} else {
-			log.Printf("uid %d num %d\n", i, 0)
+			if origin != 0 {
+				log.Printf("uid %d replay history failed origin %d actual %d historys %v", i, origin, 0, historys[i])
+				log.Printf("uid %d num %d\n", i, 0)
+			}
 		}
 	}
 	expected := (maxUID - minUID + 1) * numPerUID
@@ -327,6 +363,16 @@ func init() {
 	r = rand.New(rand.NewSource(99))
 }
 
+func printAllTxn() {
+	for tid, txn := range transactions {
+		if len(txn.participantList) != 2 {
+			log.Printf("transaction tid %d status %d\n", tid, txn.status)
+			continue
+		}
+		log.Printf("transaction tid %d from %d to %d delta %d status %d\n", tid, txn.participantList[0], txn.participantList[1], txn.delta, txn.status)
+	}
+}
+
 func main() {
 	flag.Parse()
 	go func() {
@@ -338,6 +384,8 @@ func main() {
 		go randomTransfer(i, &globalTransferTimes, &globalConflictTimes)
 	}
 	wg.Wait()
+	log.Printf("run transfers %d times conflict %d times\n", globalTransferTimes, globalConflictTimes)
+	printAllTxn()
 	checkNumSum(minUID, maxUID, numPerUID)
-	log.Printf("run transfers %d times check success\n", globalTransferTimes)
+	log.Printf("check success\n")
 }
