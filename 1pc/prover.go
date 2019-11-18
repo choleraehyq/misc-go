@@ -229,8 +229,14 @@ func resolveAndPropose(uid int, write_intent *WriteIntent) (conflicted bool) {
 		return true
 	case COMMITTED:
 		entrymu[uid].Lock()
+		if e.write_intent == nil {
+			log.Printf("tid %d COMMITTED but key %d has no write_intent", tid, uid)
+			swapped := atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&e.write_intent)), unsafe.Pointer(nil), unsafe.Pointer(write_intent))
+			entrymu[uid].Unlock()
+			return !swapped
+		}
 		if e.write_intent.tid != tid {
-			log.Printf("tid %d COMMITED but key %d is in tid %d\n", tid, uid, e.write_intent.tid)
+			log.Printf("tid %d COMMITTED but key %d is in tid %d\n", tid, uid, e.write_intent.tid)
 			entrymu[uid].Unlock()
 			return true
 		}
