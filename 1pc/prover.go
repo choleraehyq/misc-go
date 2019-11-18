@@ -299,7 +299,7 @@ func transfer(from, to int) bool {
 
 func randomTransfer(id int, globalTransferTimes *int64, globalConflictTimes *int64) {
 	defer wg.Done()
-	t := time.NewTimer(time.Second * 10)
+	t := time.NewTimer(time.Second * time.Duration(seconds))
 	var localConflictNum, localTransferNum int64
 	for {
 		select {
