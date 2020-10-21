@@ -2,12 +2,14 @@ package main
 
 /*
 #include <stdlib.h>
+#include <string>
 struct B {
 	int i;
 };
 
 struct A {
 	int j;
+	std::string s;
 	struct B b;
 };
 
