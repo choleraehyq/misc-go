@@ -1,6 +1,9 @@
 package bench
 
-// #include <stdlib.h>
+/*
+#cgo LDFLAGS: -Wl,-rpath,/usr/local/lib -ljemalloc -lm -lstdc++ -pthread -ldl
+#include <jemalloc/jemalloc.h>
+*/
 import "C"
 
 import "unsafe"
