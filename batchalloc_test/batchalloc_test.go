@@ -14,8 +14,8 @@ var bp *v
 var idp *int64
 
 func batchalloc(n int) {
-	b := make([]v, n)
-	bp = &b[0]
+	b := make([]int64, n)
+	idp = &b[0]
 }
 
 func singlealloc(n int) {

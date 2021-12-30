@@ -20,3 +20,7 @@ func BenchmarkHelloWorld(b *testing.B) {
 	}
 	println(sum)
 }
+
+func Testabc(t *testing.T) {
+	t.Errorf("fuck")
+}
